@@ -1,212 +1,269 @@
 <?php
 /**
- * src/shamir.php
- *
- * Implementação de Shamir's Secret Sharing sobre GF(2^8) — campo de Galois
- * com polinômio irredutível 0x11B (AES).
- *
- * Suporta segredos arbitrários (array de bytes).
- * Cada share é um array de bytes com o índice x na posição 0.
- *
- * Referências:
- *  - Shamir, A. (1979). "How to share a secret." CACM 22(11):612–613.
- *  - hashicorp/vault shamirutil (Go) — lógica GF(256) equivalente.
+ * src/auth.php
+ * Funções auxiliares de autenticação:
+ *  - geração de hash Argon2id
+ *  - persistência e leitura de shares nos 4 bancos
+ *  - registro e login de usuários
  */
 
 declare(strict_types=1);
 
-namespace Shamir;
+require_once __DIR__ . '/../src/shamir.php';
 
 // -------------------------------------------------------
-// Aritmética em GF(2^8) — polinômio x^8+x^4+x^3+x+1 (0x11B)
+// Constantes de configuração do Shamir
 // -------------------------------------------------------
-
-/** Multiplicação em GF(2^8) via Russian Peasant */
-function gfMul(int $a, int $b): int
-{
-    $p = 0;
-    for ($i = 0; $i < 8; $i++) {
-        if ($b & 1) {
-            $p ^= $a;
-        }
-        $carry = $a & 0x80;
-        $a     = ($a << 1) & 0xFF;
-        if ($carry) {
-            $a ^= 0x1B; // x^8 mod (x^8+x^4+x^3+x+1) = x^4+x^3+x+1 = 0x1B
-        }
-        $b >>= 1;
-    }
-    return $p & 0xFF;
-}
-
-/** Potenciação em GF(2^8) */
-function gfPow(int $base, int $exp): int
-{
-    $result = 1;
-    $base  &= 0xFF;
-    while ($exp > 0) {
-        if ($exp & 1) {
-            $result = gfMul($result, $base);
-        }
-        $base = gfMul($base, $base);
-        $exp >>= 1;
-    }
-    return $result;
-}
-
-/** Inverso multiplicativo em GF(2^8) — pelo Pequeno Teorema de Fermat: a^{-1} = a^{254} */
-function gfInv(int $a): int
-{
-    if ($a === 0) {
-        throw new \DivisionByZeroError('Inverso de 0 em GF(2^8) é indefinido.');
-    }
-    return gfPow($a, 254);
-}
+define('SHAMIR_TOTAL',     4); // n: total de shares
+define('SHAMIR_THRESHOLD', 3); // k: mínimo para reconstruir
 
 // -------------------------------------------------------
-// Avaliação de polinômio em GF(2^8)
+// Hash com Argon2id
 // -------------------------------------------------------
 
 /**
- * Avalia p(x) = coefficients[0] + coefficients[1]*x + ... + coefficients[k-1]*x^{k-1}
- * em GF(2^8).
- *
- * @param int[] $coefficients  Coeficientes do polinômio (índice 0 = coef. constante = segredo)
- * @param int   $x             Ponto de avaliação
+ * Gera hash Argon2id da senha.
  */
-function polyEval(array $coefficients, int $x): int
+function hashPassword(string $password): string
 {
-    $result = 0;
-    // Avaliação de Horner: p(x) = c0 + x*(c1 + x*(c2 + ...))
-    for ($i = count($coefficients) - 1; $i >= 0; $i--) {
-        $result = $coefficients[$i] ^ gfMul($result, $x);
-    }
-    return $result;
-}
-
-// -------------------------------------------------------
-// Interpolação de Lagrange em GF(2^8)
-// -------------------------------------------------------
-
-/**
- * Reconstrói o valor secreto (coeficiente constante) a partir de $threshold shares.
- *
- * @param array<int,int> $xValues  Índices x dos shares (1-based)
- * @param array<int,int> $yValues  Valores y correspondentes
- */
-function lagrangeInterpolate(array $xValues, array $yValues): int
-{
-    $k      = count($xValues);
-    $secret = 0;
-
-    for ($i = 0; $i < $k; $i++) {
-        $num = 1;
-        $den = 1;
-        for ($j = 0; $j < $k; $j++) {
-            if ($i === $j) {
-                continue;
-            }
-            $num = gfMul($num, $xValues[$j]);               // num *= x_j
-            $den = gfMul($den, $xValues[$i] ^ $xValues[$j]); // den *= (x_i XOR x_j)
-        }
-        $lagrange = gfMul($num, gfInv($den));
-        $secret  ^= gfMul($yValues[$i], $lagrange);
-    }
-
-    return $secret & 0xFF;
-}
-
-// -------------------------------------------------------
-// API pública
-// -------------------------------------------------------
-
-/**
- * Divide um segredo binário (string de bytes) em $n shares com threshold $k.
- *
- * @param string $secret     Segredo em bytes (ex.: hash Argon2id)
- * @param int    $n          Número total de shares
- * @param int    $k          Threshold (mínimo de shares para reconstruir)
- * @return array<int, string> Mapa [1..n => string_de_bytes_do_share]
- */
-function split(string $secret, int $n, int $k): array
-{
-    if ($k < 2 || $k > $n) {
-        throw new \InvalidArgumentException("Threshold inválido: k=$k, n=$n");
-    }
-    if ($n > 255) {
-        throw new \InvalidArgumentException('Número máximo de shares é 255.');
-    }
-
-    $secretBytes = array_values(unpack('C*', $secret));
-    $len         = count($secretBytes);
-
-    // Gera pontos x únicos e aleatórios em [1..255] para cada share
-    $xCoords = [];
-    while (count($xCoords) < $n) {
-        $candidate = ord(random_bytes(1));
-        if ($candidate !== 0 && !in_array($candidate, $xCoords, true)) {
-            $xCoords[] = $candidate;
-        }
-    }
-
-    // Para cada byte do segredo, gera um polinômio de grau (k-1)
-    // e avalia nos n pontos
-    $shares = array_fill(1, $n, '');
-
-    for ($byteIdx = 0; $byteIdx < $len; $byteIdx++) {
-        // Coeficiente constante = byte do segredo; demais aleatórios
-        $coefficients = [$secretBytes[$byteIdx]];
-        for ($d = 1; $d < $k; $d++) {
-            // Coeficiente aleatório em GF(2^8), pode ser 0 (não afeta segurança)
-            $coefficients[] = ord(random_bytes(1));
-        }
-
-        for ($shareIdx = 0; $shareIdx < $n; $shareIdx++) {
-            $y = polyEval($coefficients, $xCoords[$shareIdx]);
-            $shares[$shareIdx + 1] .= chr($y);
-        }
-    }
-
-    // Prefixa cada share com seu x (1 byte) para facilitar reconstrução
-    $result = [];
-    for ($i = 0; $i < $n; $i++) {
-        $result[$i + 1] = chr($xCoords[$i]) . $shares[$i + 1];
-    }
-
-    return $result;
+    return password_hash($password, PASSWORD_ARGON2ID, [
+        'memory_cost' => 65536, // 64 MB
+        'time_cost'   => 4,
+        'threads'     => 2,
+    ]);
 }
 
 /**
- * Reconstrói o segredo a partir de $k ou mais shares.
- *
- * @param string[] $shares  Array de shares (qualquer subset com |shares| >= threshold)
- * @return string           Segredo reconstruído em bytes
+ * Verifica se hash reconstruído bate com a senha informada.
  */
-function combine(array $shares): string
+function verifyPassword(string $password, string $hash): bool
 {
-    if (count($shares) < 2) {
-        throw new \InvalidArgumentException('São necessários pelo menos 2 shares.');
+    return password_verify($password, $hash);
+}
+
+// -------------------------------------------------------
+// Persistência de shares
+// -------------------------------------------------------
+
+/**
+ * Salva 1 share no banco de índice $dbIndex.
+ *
+ * @param PDO[]  $dbConnections  Mapa [1..4 => PDO]
+ * @param int    $dbIndex        Qual banco usar (1-4)
+ * @param int    $userId         ID do usuário no DB principal
+ * @param int    $shareIndex     Índice lógico do share (1-4)
+ * @param string $shareBytes     Bytes brutos do share
+ */
+function saveShare(
+    array  $dbConnections,
+    int    $dbIndex,
+    int    $userId,
+    int    $shareIndex,
+    string $shareBytes
+): void {
+    $pdo  = $dbConnections[$dbIndex];
+    $b64  = base64_encode($shareBytes);
+
+    $stmt = $pdo->prepare(
+        'INSERT INTO shares (user_id, share_index, share_value)
+         VALUES (:uid, :idx, :val)
+         ON DUPLICATE KEY UPDATE share_value = VALUES(share_value)'
+    );
+    $stmt->execute([
+        ':uid' => $userId,
+        ':idx' => $shareIndex,
+        ':val' => $b64,
+    ]);
+}
+
+/**
+ * Lê 1 share de um banco específico.
+ *
+ * @return string|null  Bytes brutos do share, ou null se não encontrado
+ */
+function loadShare(
+    array $dbConnections,
+    int   $dbIndex,
+    int   $userId,
+    int   $shareIndex
+): ?string {
+    $pdo  = $dbConnections[$dbIndex];
+    $stmt = $pdo->prepare(
+        'SELECT share_value FROM shares
+         WHERE user_id = :uid AND share_index = :idx
+         LIMIT 1'
+    );
+    $stmt->execute([':uid' => $userId, ':idx' => $shareIndex]);
+    $row = $stmt->fetch();
+
+    if (!$row) {
+        return null;
     }
 
-    // Extrai x e bytes de conteúdo de cada share
-    $xValues    = [];
-    $shareBytes = [];
+    $decoded = base64_decode($row['share_value'], strict: true);
+    return ($decoded === false) ? null : $decoded;
+}
 
-    foreach (array_values($shares) as $share) {
-        if (strlen($share) < 2) {
-            throw new \InvalidArgumentException('Share inválido ou corrompido.');
+// -------------------------------------------------------
+// Registro de usuário
+// -------------------------------------------------------
+
+/**
+ * Registra um novo usuário:
+ *  1. Cria registro na tabela users (DB1)
+ *  2. Gera hash Argon2id
+ *  3. Divide em 4 shares (threshold 3)
+ *  4. Salva share i no banco i
+ *
+ * @param PDO    $dbMain         Conexão DB1 (principal)
+ * @param PDO[]  $dbConnections  Mapa [1..4 => PDO]
+ * @param string $email
+ * @param string $password
+ * @throws RuntimeException se e-mail já estiver cadastrado
+ */
+function registerUser(
+    PDO    $dbMain,
+    array  $dbConnections,
+    string $email,
+    string $password
+): void {
+    // Verifica duplicidade
+    $chk = $dbMain->prepare('SELECT id FROM users WHERE email = :email LIMIT 1');
+    $chk->execute([':email' => $email]);
+    if ($chk->fetch()) {
+        throw new \RuntimeException('E-mail já cadastrado.');
+    }
+
+    // Insere usuário (sem senha)
+    $ins = $dbMain->prepare('INSERT INTO users (email) VALUES (:email)');
+    $ins->execute([':email' => $email]);
+    $userId = (int) $dbMain->lastInsertId();
+
+    // Hash Argon2id
+    $hash = hashPassword($password);
+
+    // Divide hash em 4 shares
+    $shares = \Shamir\split($hash, SHAMIR_TOTAL, SHAMIR_THRESHOLD);
+
+    // Persiste share i no banco i
+    foreach ($shares as $shareIndex => $shareBytes) {
+        saveShare($dbConnections, $shareIndex, $userId, $shareIndex, $shareBytes);
+    }
+}
+
+// -------------------------------------------------------
+// Login de usuário
+// -------------------------------------------------------
+
+/**
+ * Tenta autenticar o usuário:
+ *  1. Busca ID pelo e-mail (DB1)
+ *  2. Coleta os shares dos bancos 1, 2 e 3 (threshold 3)
+ *  3. Reconstrói o hash via Shamir
+ *  4. Verifica com password_verify
+ *
+ * @param PDO    $dbMain
+ * @param PDO[]  $dbConnections
+ * @param string $email
+ * @param string $password
+ * @return array{id:int,email:string}  Dados do usuário autenticado
+ * @throws RuntimeException em falha de autenticação
+ */
+function loginUser(
+    PDO    $dbMain,
+    array  $dbConnections,
+    string $email,
+    string $password
+): array {
+    // Busca usuário
+    $stmt = $dbMain->prepare('SELECT id, email FROM users WHERE email = :email LIMIT 1');
+    $stmt->execute([':email' => $email]);
+    $user = $stmt->fetch();
+
+    if (!$user) {
+        // Tempo constante para evitar user-enumeration timing
+        password_verify($password, '$argon2id$v=19$m=65536,t=4,p=2$fakesalt$fakehash');
+        throw new \RuntimeException('Credenciais inválidas.');
+    }
+
+    $userId = (int) $user['id'];
+
+    // Coleta os 3 primeiros shares (bancos 1, 2, 3) — threshold = 3
+    $collectedShares = [];
+    foreach ([1, 2, 3] as $dbIndex) {
+        $share = loadShare($dbConnections, $dbIndex, $userId, $dbIndex);
+        if ($share === null) {
+            throw new \RuntimeException("Share $dbIndex não encontrado. Banco corrompido?");
         }
-        $xValues[]    = ord($share[0]);
-        $shareBytes[] = array_values(unpack('C*', substr($share, 1)));
+        $collectedShares[] = $share;
     }
 
-    $len    = count($shareBytes[0]);
-    $secret = '';
+    // Reconstrói o hash
+    $reconstructedHash = \Shamir\combine($collectedShares);
 
-    for ($byteIdx = 0; $byteIdx < $len; $byteIdx++) {
-        $yValues = array_column($shareBytes, $byteIdx);
-        $secret .= chr(lagrangeInterpolate($xValues, $yValues));
+    // Valida senha
+    if (!verifyPassword($password, $reconstructedHash)) {
+        throw new \RuntimeException('Credenciais inválidas.');
     }
 
-    return $secret;
+    return ['id' => $userId, 'email' => $user['email']];
+}
+
+// -------------------------------------------------------
+// Helpers de sessão
+// -------------------------------------------------------
+
+function isLoggedIn(): bool
+{
+    return !empty($_SESSION['user_id']);
+}
+
+function requireLogin(): void
+{
+    if (!isLoggedIn()) {
+        header('Location: index.php');
+        exit;
+    }
+}
+
+function sessionLogin(int $userId, string $email): void
+{
+    session_regenerate_id(true);
+    $_SESSION['user_id'] = $userId;
+    $_SESSION['email']   = $email;
+}
+
+function sessionLogout(): void
+{
+    $_SESSION = [];
+    if (ini_get('session.use_cookies')) {
+        $params = session_get_cookie_params();
+        setcookie(
+            session_name(), '', time() - 42000,
+            $params['path'], $params['domain'],
+            $params['secure'], $params['httponly']
+        );
+    }
+    session_destroy();
+}
+
+// -------------------------------------------------------
+// CSRF simples
+// -------------------------------------------------------
+
+function csrfToken(): string
+{
+    if (empty($_SESSION['csrf_token'])) {
+        $_SESSION['csrf_token'] = bin2hex(random_bytes(32));
+    }
+    return $_SESSION['csrf_token'];
+}
+
+function verifyCsrf(string $token): bool
+{
+    // Token vazio ou sessão sem token gerado → inválido
+    if (empty($_SESSION['csrf_token']) || $token === '') {
+        return false;
+    }
+    return hash_equals($_SESSION['csrf_token'], $token);
 }

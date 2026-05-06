@@ -1,30 +1,54 @@
 <?php
 /**
  * config.php
- * Carrega variáveis do .env e abre as 4 conexões PDO.
+ * Carrega variáveis do .env, inicia sessão e abre as 4 conexões PDO.
+ *
+ * ORDEM DE EXECUÇÃO (importante):
+ *  1. Sessão iniciada PRIMEIRO (funções de auth.php dependem de $_SESSION)
+ *  2. .env carregado
+ *  3. Conexões PDO abertas
  */
 
 declare(strict_types=1);
 
 // -------------------------------------------------------
-// 1. Carregador mínimo de .env (sem dependências externas)
+// 1. Sessão segura — deve ser a primeira coisa
+// -------------------------------------------------------
+if (session_status() === PHP_SESSION_NONE) {
+    session_set_cookie_params([
+        'lifetime' => 3600,
+        'path'     => '/',
+        'secure'   => false,   // mude para true em produção (HTTPS)
+        'httponly' => true,
+        'samesite' => 'Strict',
+    ]);
+    session_start();
+}
+
+// -------------------------------------------------------
+// 2. Carregador mínimo de .env (sem dependências externas)
 // -------------------------------------------------------
 function loadEnv(string $path): void
 {
     if (!file_exists($path)) {
-        throw new RuntimeException(".env não encontrado em: $path");
+        die(
+            '<pre style="font-family:monospace;padding:20px;background:#1e1e2e;color:#f38ba8;">' .
+            "ERRO: Arquivo .env não encontrado.\n\n" .
+            "Copie o arquivo de exemplo e preencha seus dados:\n" .
+            "  cp .env.example .env\n\n" .
+            "Caminho esperado: $path" .
+            '</pre>'
+        );
     }
 
     $lines = file($path, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES);
     foreach ($lines as $line) {
         $line = trim($line);
 
-        // Ignora comentários e linhas vazias
-        if ($line === '' || str_starts_with($line, '#')) {
+        if ($line === '' || $line[0] === '#') {
             continue;
         }
 
-        // Separa chave=valor
         if (!str_contains($line, '=')) {
             continue;
         }
@@ -33,15 +57,17 @@ function loadEnv(string $path): void
         $key   = trim($key);
         $value = trim($value);
 
-        // Remove aspas envolventes opcionais
+        // Remove aspas envolventes opcionais ("valor" ou 'valor')
         if (
             strlen($value) >= 2 &&
-            (($value[0] === '"' && $value[-1] === '"') || ($value[0] === "'" && $value[-1] === "'"))
+            (
+                ($value[0] === '"'  && $value[-1] === '"')  ||
+                ($value[0] === "'"  && $value[-1] === "'")
+            )
         ) {
             $value = substr($value, 1, -1);
         }
 
-        // Só define se ainda não estiver no ambiente
         if (!array_key_exists($key, $_ENV)) {
             $_ENV[$key] = $value;
             putenv("$key=$value");
@@ -50,29 +76,34 @@ function loadEnv(string $path): void
 }
 
 // -------------------------------------------------------
-// 2. Helper: lê variável de ambiente (obrigatória)
+// 3. Helper: lê variável de ambiente
 // -------------------------------------------------------
-function env(string $key, mixed $default = null): mixed
+function env(string $key, string $default = ''): string
 {
     $value = $_ENV[$key] ?? getenv($key);
 
-    if ($value === false || $value === null) {
-        if ($default !== null) {
+    if ($value === false || $value === null || $value === '') {
+        if ($default !== '') {
             return $default;
         }
-        throw new RuntimeException("Variável de ambiente ausente: $key");
+        die(
+            '<pre style="font-family:monospace;padding:20px;background:#1e1e2e;color:#f38ba8;">' .
+            "ERRO: Variável de ambiente obrigatória não encontrada: $key\n\n" .
+            'Verifique seu arquivo .env.' .
+            '</pre>'
+        );
     }
 
-    return $value;
+    return (string) $value;
 }
 
 // -------------------------------------------------------
-// 3. Carrega o arquivo .env da raiz do projeto
+// 4. Carrega o .env
 // -------------------------------------------------------
 loadEnv(__DIR__ . '/.env');
 
 // -------------------------------------------------------
-// 4. Factory de conexão PDO
+// 5. Factory de conexão PDO
 // -------------------------------------------------------
 function makePdo(
     string $host,
@@ -89,12 +120,24 @@ function makePdo(
         PDO::ATTR_EMULATE_PREPARES   => false,
     ];
 
-    return new PDO($dsn, $user, $pass, $options);
+    try {
+        return new PDO($dsn, $user, $pass, $options);
+    } catch (PDOException $e) {
+        die(
+            '<pre style="font-family:monospace;padding:20px;background:#1e1e2e;color:#f38ba8;">' .
+            "ERRO: Não foi possível conectar ao banco \"$dbname\" em $host:$port\n\n" .
+            'Mensagem: ' . $e->getMessage() . "\n\n" .
+            "Verifique:\n" .
+            "  1. MySQL está rodando (XAMPP → Start MySQL)\n" .
+            "  2. As credenciais no .env estão corretas\n" .
+            "  3. O banco de dados foi criado (rode sql/schema.sql)" .
+            '</pre>'
+        );
+    }
 }
 
 // -------------------------------------------------------
-// 5. Abre as 4 conexões
-//    $dbConnections[1..4] → PDO de cada banco
+// 6. Abre as 4 conexões  →  $dbConnections[1..4]
 // -------------------------------------------------------
 $dbConnections = [];
 
@@ -108,19 +151,5 @@ for ($i = 1; $i <= 4; $i++) {
     );
 }
 
-// Alias semântico: DB principal é sempre o índice 1
+// Alias para o banco principal (DB1 contém a tabela users)
 $dbMain = $dbConnections[1];
-
-// -------------------------------------------------------
-// 6. Sessão segura
-// -------------------------------------------------------
-if (session_status() === PHP_SESSION_NONE) {
-    session_set_cookie_params([
-        'lifetime' => (int) env('SESSION_LIFETIME', '3600'),
-        'path'     => '/',
-        'secure'   => false,   // altere para true em produção (HTTPS)
-        'httponly' => true,
-        'samesite' => 'Strict',
-    ]);
-    session_start();
-}
