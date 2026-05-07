@@ -188,17 +188,39 @@ function loginUser(
 
     $userId = (int) $user['id'];
 
-    // Coleta os 3 primeiros shares (bancos 1, 2, 3) — threshold = 3
+    // Tenta coletar shares dos 4 bancos, aceita os 3 primeiros que responderem.
+    // Isso usa a redundância do Shamir (n=4, threshold=3): se um banco estiver
+    // indisponível o login ainda funciona com os 3 restantes.
     $collectedShares = [];
-    foreach ([1, 2, 3] as $dbIndex) {
-        $share = loadShare($dbConnections, $dbIndex, $userId, $dbIndex);
-        if ($share === null) {
-            throw new \RuntimeException("Share $dbIndex não encontrado. Banco corrompido?");
+    $failedBanks     = [];
+
+    for ($dbIndex = 1; $dbIndex <= SHAMIR_TOTAL; $dbIndex++) {
+        if (count($collectedShares) >= SHAMIR_THRESHOLD) {
+            break; // já temos shares suficientes
         }
-        $collectedShares[] = $share;
+
+        try {
+            $share = loadShare($dbConnections, $dbIndex, $userId, $dbIndex);
+            if ($share !== null) {
+                $collectedShares[] = $share;
+            } else {
+                $failedBanks[] = $dbIndex;
+            }
+        } catch (\PDOException) {
+            // Banco indisponível — tenta o próximo
+            $failedBanks[] = $dbIndex;
+        }
     }
 
-    // Reconstrói o hash
+    if (count($collectedShares) < SHAMIR_THRESHOLD) {
+        $missing = count($failedBanks);
+        throw new \RuntimeException(
+            "Não foi possível coletar shares suficientes para autenticar. " .
+            "$missing banco(s) indisponível(is): DB" . implode(', DB', $failedBanks)
+        );
+    }
+
+    // Reconstrói o hash com os SHAMIR_THRESHOLD shares coletados
     $reconstructedHash = \Shamir\combine($collectedShares);
 
     // Valida senha
