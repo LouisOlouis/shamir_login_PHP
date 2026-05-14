@@ -1,10 +1,13 @@
 <?php
 /**
  * src/auth.php
- * Funções auxiliares de autenticação:
- *  - geração de hash Argon2id
- *  - persistência e leitura de shares nos 4 bancos
- *  - registro e login de usuários
+ * Funções auxiliares de autenticação.
+ *
+ * Tolerância a falha:
+ *  - loadShare() retorna null se a conexão do banco for null (offline)
+ *  - saveShare()  lança exceção apenas se banco obrigatório falhar
+ *  - loginUser()  coleta os 3 primeiros shares disponíveis dentre os 4 bancos
+ *  - registerUser() aborta se não conseguir salvar shares suficientes
  */
 
 declare(strict_types=1);
@@ -14,16 +17,13 @@ require_once __DIR__ . '/../src/shamir.php';
 // -------------------------------------------------------
 // Constantes de configuração do Shamir
 // -------------------------------------------------------
-define('SHAMIR_TOTAL',     4); // n: total de shares
-define('SHAMIR_THRESHOLD', 3); // k: mínimo para reconstruir
+define('SHAMIR_TOTAL',     4); // n: total de shares gerados
+define('SHAMIR_THRESHOLD', 3); // k: mínimo para reconstruir o hash
 
 // -------------------------------------------------------
 // Hash com Argon2id
 // -------------------------------------------------------
 
-/**
- * Gera hash Argon2id da senha.
- */
 function hashPassword(string $password): string
 {
     return password_hash($password, PASSWORD_ARGON2ID, [
@@ -33,9 +33,6 @@ function hashPassword(string $password): string
     ]);
 }
 
-/**
- * Verifica se hash reconstruído bate com a senha informada.
- */
 function verifyPassword(string $password, string $hash): bool
 {
     return password_verify($password, $hash);
@@ -46,13 +43,9 @@ function verifyPassword(string $password, string $hash): bool
 // -------------------------------------------------------
 
 /**
- * Salva 1 share no banco de índice $dbIndex.
- *
- * @param PDO[]  $dbConnections  Mapa [1..4 => PDO]
- * @param int    $dbIndex        Qual banco usar (1-4)
- * @param int    $userId         ID do usuário no DB principal
- * @param int    $shareIndex     Índice lógico do share (1-4)
- * @param string $shareBytes     Bytes brutos do share
+ * Salva 1 share no banco $dbIndex.
+ * Retorna true em sucesso, false se banco estiver offline (null).
+ * Lança PDOException somente em erro inesperado de SQL.
  */
 function saveShare(
     array  $dbConnections,
@@ -60,26 +53,27 @@ function saveShare(
     int    $userId,
     int    $shareIndex,
     string $shareBytes
-): void {
-    $pdo  = $dbConnections[$dbIndex];
-    $b64  = base64_encode($shareBytes);
+): bool {
+    $pdo = $dbConnections[$dbIndex] ?? null;
 
+    // Banco offline: não é possível salvar
+    if ($pdo === null) {
+        return false;
+    }
+
+    $b64  = base64_encode($shareBytes);
     $stmt = $pdo->prepare(
         'INSERT INTO shares (user_id, share_index, share_value)
          VALUES (:uid, :idx, :val)
          ON DUPLICATE KEY UPDATE share_value = VALUES(share_value)'
     );
-    $stmt->execute([
-        ':uid' => $userId,
-        ':idx' => $shareIndex,
-        ':val' => $b64,
-    ]);
+    $stmt->execute([':uid' => $userId, ':idx' => $shareIndex, ':val' => $b64]);
+    return true;
 }
 
 /**
- * Lê 1 share de um banco específico.
- *
- * @return string|null  Bytes brutos do share, ou null se não encontrado
+ * Lê 1 share de um banco.
+ * Retorna null se banco offline (null) ou share não encontrado.
  */
 function loadShare(
     array $dbConnections,
@@ -87,7 +81,13 @@ function loadShare(
     int   $userId,
     int   $shareIndex
 ): ?string {
-    $pdo  = $dbConnections[$dbIndex];
+    $pdo = $dbConnections[$dbIndex] ?? null;
+
+    // Banco offline
+    if ($pdo === null) {
+        return null;
+    }
+
     $stmt = $pdo->prepare(
         'SELECT share_value FROM shares
          WHERE user_id = :uid AND share_index = :idx
@@ -109,17 +109,13 @@ function loadShare(
 // -------------------------------------------------------
 
 /**
- * Registra um novo usuário:
- *  1. Cria registro na tabela users (DB1)
- *  2. Gera hash Argon2id
- *  3. Divide em 4 shares (threshold 3)
- *  4. Salva share i no banco i
+ * Registra um novo usuário.
  *
- * @param PDO    $dbMain         Conexão DB1 (principal)
- * @param PDO[]  $dbConnections  Mapa [1..4 => PDO]
- * @param string $email
- * @param string $password
- * @throws RuntimeException se e-mail já estiver cadastrado
+ * Exige que todos os bancos que estiverem online recebam seu share.
+ * Se menos de SHAMIR_THRESHOLD bancos estiverem disponíveis, aborta
+ * e desfaz o insert do usuário (rollback manual).
+ *
+ * @throws RuntimeException
  */
 function registerUser(
     PDO    $dbMain,
@@ -134,20 +130,54 @@ function registerUser(
         throw new \RuntimeException('E-mail já cadastrado.');
     }
 
-    // Insere usuário (sem senha)
+    // Conta quantos bancos estão disponíveis antes de inserir qualquer coisa
+    $availableBanks = 0;
+    for ($i = 1; $i <= SHAMIR_TOTAL; $i++) {
+        if ($dbConnections[$i] !== null) {
+            $availableBanks++;
+        }
+    }
+
+    if ($availableBanks < SHAMIR_THRESHOLD) {
+        throw new \RuntimeException(
+            "Apenas $availableBanks banco(s) disponível(is). " .
+            'São necessários pelo menos ' . SHAMIR_THRESHOLD . ' para registrar com segurança. ' .
+            'Verifique se os servidores secundários estão online.'
+        );
+    }
+
+    // Insere usuário
     $ins = $dbMain->prepare('INSERT INTO users (email) VALUES (:email)');
     $ins->execute([':email' => $email]);
     $userId = (int) $dbMain->lastInsertId();
 
-    // Hash Argon2id
-    $hash = hashPassword($password);
-
-    // Divide hash em 4 shares
+    // Hash Argon2id + divisão em shares
+    $hash   = hashPassword($password);
     $shares = \Shamir\split($hash, SHAMIR_TOTAL, SHAMIR_THRESHOLD);
 
-    // Persiste share i no banco i
+    // Salva shares nos bancos disponíveis
+    $savedCount  = 0;
+    $failedBanks = [];
+
     foreach ($shares as $shareIndex => $shareBytes) {
-        saveShare($dbConnections, $shareIndex, $userId, $shareIndex, $shareBytes);
+        $ok = saveShare($dbConnections, $shareIndex, $userId, $shareIndex, $shareBytes);
+        if ($ok) {
+            $savedCount++;
+        } else {
+            $failedBanks[] = $shareIndex;
+        }
+    }
+
+    // Se não salvou shares suficientes, apaga o usuário e lança erro
+    if ($savedCount < SHAMIR_THRESHOLD) {
+        $del = $dbMain->prepare('DELETE FROM users WHERE id = :id');
+        $del->execute([':id' => $userId]);
+
+        throw new \RuntimeException(
+            "Registro abortado: apenas $savedCount share(s) salvo(s). " .
+            'Banco(s) offline: DB' . implode(', DB', $failedBanks) . '. ' .
+            'Verifique os servidores e tente novamente.'
+        );
     }
 }
 
@@ -156,18 +186,11 @@ function registerUser(
 // -------------------------------------------------------
 
 /**
- * Tenta autenticar o usuário:
- *  1. Busca ID pelo e-mail (DB1)
- *  2. Coleta os shares dos bancos 1, 2 e 3 (threshold 3)
- *  3. Reconstrói o hash via Shamir
- *  4. Verifica com password_verify
+ * Autentica o usuário buscando shares nos 4 bancos.
+ * Usa os 3 primeiros que responderem (threshold=3).
+ * Tolera 1 banco secundário offline.
  *
- * @param PDO    $dbMain
- * @param PDO[]  $dbConnections
- * @param string $email
- * @param string $password
- * @return array{id:int,email:string}  Dados do usuário autenticado
- * @throws RuntimeException em falha de autenticação
+ * @throws RuntimeException
  */
 function loginUser(
     PDO    $dbMain,
@@ -175,28 +198,33 @@ function loginUser(
     string $email,
     string $password
 ): array {
-    // Busca usuário
+    // Busca usuário pelo email
     $stmt = $dbMain->prepare('SELECT id, email FROM users WHERE email = :email LIMIT 1');
     $stmt->execute([':email' => $email]);
     $user = $stmt->fetch();
 
     if (!$user) {
-        // Tempo constante para evitar user-enumeration timing
-        password_verify($password, '$argon2id$v=19$m=65536,t=4,p=2$fakesalt$fakehash');
+        // Executa hash fake para manter tempo constante (evita user-enumeration)
+        password_verify($password, '$argon2id$v=19$m=65536,t=4,p=2$ZmFrZXNhbHRmYWtl$ZmFrZWhhc2hmYWtlaGFzaA');
         throw new \RuntimeException('Credenciais inválidas.');
     }
 
     $userId = (int) $user['id'];
 
-    // Tenta coletar shares dos 4 bancos, aceita os 3 primeiros que responderem.
-    // Isso usa a redundância do Shamir (n=4, threshold=3): se um banco estiver
-    // indisponível o login ainda funciona com os 3 restantes.
+    // Coleta shares dos 4 bancos — para ao atingir threshold=3
+    // Bancos offline (null) são pulados automaticamente
     $collectedShares = [];
     $failedBanks     = [];
 
     for ($dbIndex = 1; $dbIndex <= SHAMIR_TOTAL; $dbIndex++) {
         if (count($collectedShares) >= SHAMIR_THRESHOLD) {
-            break; // já temos shares suficientes
+            break;
+        }
+
+        // Banco offline? pula
+        if ($dbConnections[$dbIndex] === null) {
+            $failedBanks[] = $dbIndex;
+            continue;
         }
 
         try {
@@ -204,26 +232,31 @@ function loginUser(
             if ($share !== null) {
                 $collectedShares[] = $share;
             } else {
+                // Banco online mas share ausente (dado corrompido/apagado)
                 $failedBanks[] = $dbIndex;
+                error_log("[ShamirAuth] Share $dbIndex ausente para user_id=$userId");
             }
-        } catch (\PDOException) {
-            // Banco indisponível — tenta o próximo
+        } catch (\PDOException $e) {
+            // Erro de SQL inesperado durante a leitura
             $failedBanks[] = $dbIndex;
+            error_log("[ShamirAuth] Erro ao ler share $dbIndex: " . $e->getMessage());
         }
     }
 
+    // Sem shares suficientes → login impossível
     if (count($collectedShares) < SHAMIR_THRESHOLD) {
-        $missing = count($failedBanks);
+        $available = count($collectedShares);
         throw new \RuntimeException(
-            "Não foi possível coletar shares suficientes para autenticar. " .
-            "$missing banco(s) indisponível(is): DB" . implode(', DB', $failedBanks)
+            "Servidores insuficientes para autenticar ($available/" . SHAMIR_THRESHOLD . " disponíveis). " .
+            'Banco(s) offline: DB' . implode(', DB', $failedBanks) . '. ' .
+            'São necessários pelo menos ' . SHAMIR_THRESHOLD . ' servidores online.'
         );
     }
 
-    // Reconstrói o hash com os SHAMIR_THRESHOLD shares coletados
+    // Reconstrói o hash Argon2id via interpolação de Lagrange
     $reconstructedHash = \Shamir\combine($collectedShares);
 
-    // Valida senha
+    // Valida a senha contra o hash reconstruído
     if (!verifyPassword($password, $reconstructedHash)) {
         throw new \RuntimeException('Credenciais inválidas.');
     }
@@ -270,7 +303,7 @@ function sessionLogout(): void
 }
 
 // -------------------------------------------------------
-// CSRF simples
+// CSRF
 // -------------------------------------------------------
 
 function csrfToken(): string
@@ -283,9 +316,17 @@ function csrfToken(): string
 
 function verifyCsrf(string $token): bool
 {
-    // Token vazio ou sessão sem token gerado → inválido
     if (empty($_SESSION['csrf_token']) || $token === '') {
         return false;
     }
     return hash_equals($_SESSION['csrf_token'], $token);
+}
+
+// -------------------------------------------------------
+// Flash messages
+// -------------------------------------------------------
+
+function setFlash(string $type, string $message): void
+{
+    $_SESSION['flash'] = ['type' => $type, 'message' => $message];
 }

@@ -1,24 +1,23 @@
 <?php
 /**
  * config.php
- * Carrega variáveis do .env, inicia sessão e abre as 4 conexões PDO.
  *
- * ORDEM DE EXECUÇÃO (importante):
- *  1. Sessão iniciada PRIMEIRO (funções de auth.php dependem de $_SESSION)
- *  2. .env carregado
- *  3. Conexões PDO abertas
+ * Carrega .env, inicia sessão e prepara conexões PDO de forma LAZY:
+ * - DB1 (principal) é conectado imediatamente — sem ele o sistema não funciona.
+ * - DB2, DB3, DB4 são conectados sob demanda e toleram falha.
+ *   Um banco secundário offline NÃO impede a abertura do site.
  */
 
 declare(strict_types=1);
 
 // -------------------------------------------------------
-// 1. Sessão segura — deve ser a primeira coisa
+// 1. Sessão segura — sempre primeiro
 // -------------------------------------------------------
 if (session_status() === PHP_SESSION_NONE) {
     session_set_cookie_params([
         'lifetime' => 3600,
         'path'     => '/',
-        'secure'   => false,   // mude para true em produção (HTTPS)
+        'secure'   => false,
         'httponly' => true,
         'samesite' => 'Strict',
     ]);
@@ -26,7 +25,7 @@ if (session_status() === PHP_SESSION_NONE) {
 }
 
 // -------------------------------------------------------
-// 2. Carregador mínimo de .env (sem dependências externas)
+// 2. Carregador de .env
 // -------------------------------------------------------
 function loadEnv(string $path): void
 {
@@ -34,36 +33,24 @@ function loadEnv(string $path): void
         die(
             '<pre style="font-family:monospace;padding:20px;background:#1e1e2e;color:#f38ba8;">' .
             "ERRO: Arquivo .env não encontrado.\n\n" .
-            "Copie o arquivo de exemplo e preencha seus dados:\n" .
-            "  cp .env.example .env\n\n" .
-            "Caminho esperado: $path" .
-            '</pre>'
+            "Copie o template e preencha:\n  cp .env.example .env\n\n" .
+            "Caminho esperado: $path</pre>"
         );
     }
 
-    $lines = file($path, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES);
-    foreach ($lines as $line) {
+    foreach (file($path, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES) as $line) {
         $line = trim($line);
-
-        if ($line === '' || $line[0] === '#') {
+        if ($line === '' || $line[0] === '#' || !str_contains($line, '=')) {
             continue;
         }
-
-        if (!str_contains($line, '=')) {
-            continue;
-        }
-
         [$key, $value] = explode('=', $line, 2);
         $key   = trim($key);
         $value = trim($value);
 
-        // Remove aspas envolventes opcionais ("valor" ou 'valor')
         if (
             strlen($value) >= 2 &&
-            (
-                ($value[0] === '"'  && $value[-1] === '"')  ||
-                ($value[0] === "'"  && $value[-1] === "'")
-            )
+            (($value[0] === '"' && $value[-1] === '"') ||
+             ($value[0] === "'" && $value[-1] === "'"))
         ) {
             $value = substr($value, 1, -1);
         }
@@ -88,9 +75,7 @@ function env(string $key, string $default = ''): string
         }
         die(
             '<pre style="font-family:monospace;padding:20px;background:#1e1e2e;color:#f38ba8;">' .
-            "ERRO: Variável de ambiente obrigatória não encontrada: $key\n\n" .
-            'Verifique seu arquivo .env.' .
-            '</pre>'
+            "ERRO: Variável obrigatória ausente no .env: $key</pre>"
         );
     }
 
@@ -98,58 +83,77 @@ function env(string $key, string $default = ''): string
 }
 
 // -------------------------------------------------------
-// 4. Carrega o .env
+// 4. Carrega .env
 // -------------------------------------------------------
 loadEnv(__DIR__ . '/.env');
 
 // -------------------------------------------------------
 // 5. Factory de conexão PDO
+//    $required = true  → die() se falhar (banco principal)
+//    $required = false → retorna null se falhar (bancos secundários)
 // -------------------------------------------------------
 function makePdo(
     string $host,
     int    $port,
     string $dbname,
     string $user,
-    string $pass
-): PDO {
-    $dsn = "mysql:host=$host;port=$port;dbname=$dbname;charset=utf8mb4";
-
+    string $pass,
+    bool   $required = false
+): ?PDO {
+    $dsn     = "mysql:host=$host;port=$port;dbname=$dbname;charset=utf8mb4";
     $options = [
         PDO::ATTR_ERRMODE            => PDO::ERRMODE_EXCEPTION,
         PDO::ATTR_DEFAULT_FETCH_MODE => PDO::FETCH_ASSOC,
         PDO::ATTR_EMULATE_PREPARES   => false,
+        PDO::ATTR_TIMEOUT            => 3, // timeout curto para servidor offline
     ];
 
     try {
         return new PDO($dsn, $user, $pass, $options);
     } catch (PDOException $e) {
-        die(
-            '<pre style="font-family:monospace;padding:20px;background:#1e1e2e;color:#f38ba8;">' .
-            "ERRO: Não foi possível conectar ao banco \"$dbname\" em $host:$port\n\n" .
-            'Mensagem: ' . $e->getMessage() . "\n\n" .
-            "Verifique:\n" .
-            "  1. MySQL está rodando (XAMPP → Start MySQL)\n" .
-            "  2. As credenciais no .env estão corretas\n" .
-            "  3. O banco de dados foi criado (rode sql/schema.sql)" .
-            '</pre>'
-        );
+        if ($required) {
+            die(
+                '<pre style="font-family:monospace;padding:20px;background:#1e1e2e;color:#f38ba8;">' .
+                "ERRO CRÍTICO: Banco principal \"$dbname\" inacessível.\n\n" .
+                'Mensagem: ' . htmlspecialchars($e->getMessage()) . "\n\n" .
+                "Verifique:\n" .
+                "  1. MySQL está rodando (XAMPP → Start MySQL)\n" .
+                "  2. Credenciais DB1 no .env estão corretas\n" .
+                "  3. O banco foi criado (sql/schema.sql)</pre>"
+            );
+        }
+        // Banco secundário offline: registra no log e retorna null
+        error_log("[ShamirAuth] Banco secundário \"$dbname\" offline: " . $e->getMessage());
+        return null;
     }
 }
 
 // -------------------------------------------------------
-// 6. Abre as 4 conexões  →  $dbConnections[1..4]
+// 6. DB1 — obrigatório (contém tabela users)
 // -------------------------------------------------------
-$dbConnections = [];
+$dbConnections    = [];
+$dbConnections[1] = makePdo(
+    host    : env('DB1_HOST'),
+    port    : (int) env('DB1_PORT', '3306'),
+    dbname  : env('DB1_NAME'),
+    user    : env('DB1_USER'),
+    pass    : env('DB1_PASS'),
+    required: true
+);
 
-for ($i = 1; $i <= 4; $i++) {
+$dbMain = $dbConnections[1];
+
+// -------------------------------------------------------
+// 7. DB2, DB3, DB4 — opcionais (null se offline)
+//    auth.php trata null e pula para o próximo banco
+// -------------------------------------------------------
+for ($i = 2; $i <= 4; $i++) {
     $dbConnections[$i] = makePdo(
-        host  : env("DB{$i}_HOST"),
-        port  : (int) env("DB{$i}_PORT", '3306'),
-        dbname: env("DB{$i}_NAME"),
-        user  : env("DB{$i}_USER"),
-        pass  : env("DB{$i}_PASS")
+        host    : env("DB{$i}_HOST"),
+        port    : (int) env("DB{$i}_PORT", '3306'),
+        dbname  : env("DB{$i}_NAME"),
+        user    : env("DB{$i}_USER"),
+        pass    : env("DB{$i}_PASS"),
+        required: false
     );
 }
-
-// Alias para o banco principal (DB1 contém a tabela users)
-$dbMain = $dbConnections[1];

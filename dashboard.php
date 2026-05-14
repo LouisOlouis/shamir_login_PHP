@@ -17,6 +17,11 @@ $userId = (int) ($_SESSION['user_id'] ?? 0);
 // Demonstração: carrega metadados dos shares sem expor os valores
 $sharesMeta = [];
 for ($i = 1; $i <= 4; $i++) {
+    // Banco offline (null) → status offline, sem tentar conectar
+    if ($dbConnections[$i] === null) {
+        $sharesMeta[$i] = ['status' => 'offline', 'len' => 0];
+        continue;
+    }
     try {
         $stmt = $dbConnections[$i]->prepare(
             'SELECT share_index, LENGTH(share_value) AS b64_len
@@ -25,8 +30,8 @@ for ($i = 1; $i <= 4; $i++) {
         $stmt->execute([':uid' => $userId, ':idx' => $i]);
         $row = $stmt->fetch();
         $sharesMeta[$i] = $row
-            ? ['status' => 'ok',     'len' => $row['b64_len']]
-            : ['status' => 'missing','len' => 0];
+            ? ['status' => 'ok',      'len' => $row['b64_len']]
+            : ['status' => 'missing', 'len' => 0];
     } catch (\PDOException) {
         $sharesMeta[$i] = ['status' => 'error', 'len' => 0];
     }
@@ -80,8 +85,9 @@ for ($i = 1; $i <= 4; $i++) {
     <?php foreach ($sharesMeta as $idx => $meta): ?>
       <?php
         $ok    = $meta['status'] === 'ok';
-        $color = $ok ? 'var(--success)' : 'var(--danger)';
-        $icon  = $ok ? '✓' : '✗';
+        $offline = $meta['status'] === 'offline';
+        $color = $ok ? 'var(--success)' : ($offline ? 'var(--muted)' : 'var(--danger)');
+        $icon  = $ok ? '✓' : ($offline ? '–' : '✗');
       ?>
       <div class="info-row" style="flex-direction:column;align-items:flex-start;gap:.3rem;">
         <div style="display:flex;align-items:center;gap:.4rem;width:100%">
