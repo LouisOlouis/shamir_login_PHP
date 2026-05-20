@@ -275,7 +275,4 @@ function flashMessage(): string
     return "<div class=\"alert alert-{$type}\"><span>{$icon}</span> " . htmlspecialchars($msg) . '</div>';
 }
 
-function setFlash(string $type, string $message): void
-{
-    $_SESSION['flash'] = ['type' => $type, 'message' => $message];
-}
+// setFlash() definida em src/auth.php
